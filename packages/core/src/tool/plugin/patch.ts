@@ -114,14 +114,14 @@ export const Plugin = {
               }
               const prepared: Prepared[] = []
               const updates = new Map<string, string | null>()
-              // Preflight reads each update/delete target once, so remembering the bytes it had lets the
-              // patch fail instead of silently discarding an editor save that landed while approval was
+              // Preflight reads each update/delete target at most once, so remembering the bytes it had lets
+              // the patch fail instead of silently discarding an editor save that landed while approval was
               // pending. Comparing raw bytes means every rewrite is a conflict, including changes to
               // invalid UTF-8 bytes, a BOM, or line endings. This detects changes observed in preflight;
               // it is not atomicity: an external write between this check and the write below, or a
               // formatter rewrite, can still interleave. `add` never reads its target, so it records no
-              // snapshot and keeps overwrite semantics; an `add` followed by `delete`/`update` on the same
-              // path inherits that and is out of scope.
+              // snapshot and keeps overwrite semantics, and a `*** Move to:` destination is never read
+              // either; an `add` followed by `delete`/`update` on the same path inherits the same.
               const originals = new Map<string, { readonly resource: string; readonly bytes: Uint8Array }>()
               const resolveTarget = Effect.fnUntraced(function* (value: string) {
                 const target = yield* access.resolve({ path: value, kind: "file" })

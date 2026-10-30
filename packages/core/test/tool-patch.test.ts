@@ -1672,6 +1672,7 @@ describe("PatchTool", () => {
         reset()
         const source = path.join(tmp.path, "source.txt")
         const destination = path.join(tmp.path, "destination.txt")
+        afterEditApproval = () => Effect.promise(() => fs.writeFile(source, "before\n")).pipe(Effect.orDie)
         return Effect.promise(() => fs.writeFile(source, "before\n")).pipe(
           Effect.andThen(
             withTool(tmp.path, (registry) =>
@@ -1731,6 +1732,82 @@ describe("PatchTool", () => {
                   },
                 })
                 expect((yield* Effect.promise(() => fs.readFile(target))).at(-1)).toBe(0xfe)
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("overwrites an existing move destination that changed during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const source = path.join(tmp.path, "old.txt")
+        const destination = path.join(tmp.path, "dest.txt")
+        afterEditApproval = () =>
+          Effect.promise(() => fs.writeFile(destination, "existing\nEXTERNAL\n")).pipe(Effect.orDie)
+        return Effect.promise(() =>
+          Promise.all([fs.writeFile(source, "before\n"), fs.writeFile(destination, "existing\n")]),
+        ).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call(
+                      [
+                        "*** Begin Patch",
+                        "*** Update File: old.txt",
+                        "*** Move to: dest.txt",
+                        "@@",
+                        "-before",
+                        "+after",
+                        "*** End Patch",
+                      ].join("\n"),
+                    ),
+                  ),
+                ).toMatchObject({ status: "completed" })
+                expect(yield* Effect.promise(() => fs.readFile(destination, "utf8"))).toBe("after\n")
+                expect(yield* exists(source)).toBe(false)
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects an update when only line endings changed during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "crlf.txt")
+        afterEditApproval = () =>
+          Effect.promise(() => fs.writeFile(target, "first=old\r\nsecond=old\r\n")).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "first=old\nsecond=old\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call("*** Begin Patch\n*** Update File: crlf.txt\n@@\n-first=old\n+first=new\n*** End Patch"),
+                  ),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: crlf.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("first=old\r\nsecond=old\r\n")
               }),
             ),
           ),
