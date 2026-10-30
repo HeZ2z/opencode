@@ -1703,6 +1703,43 @@ describe("PatchTool", () => {
     ),
   )
 
+  it.live("rejects a patch when only invalid bytes changed during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "invalid.txt")
+        const body = Buffer.from("first=old\nsecond=old\n", "utf8")
+        // Both trailing bytes decode to U+FFFD, so a text comparison sees no change here.
+        const initial = Buffer.concat([body, Uint8Array.of(0xff)])
+        const rewritten = Buffer.concat([body, Uint8Array.of(0xfe)])
+        afterEditApproval = () => Effect.promise(() => fs.writeFile(target, rewritten)).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, initial)).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call("*** Begin Patch\n*** Update File: invalid.txt\n@@\n-first=old\n+first=new\n*** End Patch"),
+                  ),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: invalid.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+                expect((yield* Effect.promise(() => fs.readFile(target))).at(-1)).toBe(0xfe)
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("preserves a later commit defect after earlier sequential applications", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

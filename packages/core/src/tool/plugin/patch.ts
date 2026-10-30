@@ -114,13 +114,15 @@ export const Plugin = {
               }
               const prepared: Prepared[] = []
               const updates = new Map<string, string | null>()
-              // Preflight reads each update/delete target once, so remembering that decoded text lets the
+              // Preflight reads each update/delete target once, so remembering the bytes it had lets the
               // patch fail instead of silently discarding an editor save that landed while approval was
-              // pending. This detects changes observed in preflight; it is not atomicity: an external write
-              // between this check and the write below, or a formatter rewrite, can still interleave.
-              // `add` never reads its target, so it records no snapshot and keeps overwrite semantics; an
-              // `add` followed by `delete`/`update` on the same path inherits that and is out of scope.
-              const originals = new Map<string, { readonly resource: string; readonly text: string }>()
+              // pending. Comparing raw bytes means every rewrite is a conflict, including changes to
+              // invalid UTF-8 bytes, a BOM, or line endings. This detects changes observed in preflight;
+              // it is not atomicity: an external write between this check and the write below, or a
+              // formatter rewrite, can still interleave. `add` never reads its target, so it records no
+              // snapshot and keeps overwrite semantics; an `add` followed by `delete`/`update` on the same
+              // path inherits that and is out of scope.
+              const originals = new Map<string, { readonly resource: string; readonly bytes: Uint8Array }>()
               const resolveTarget = Effect.fnUntraced(function* (value: string) {
                 const target = yield* access.resolve({ path: value, kind: "file" })
                 if (!target.externalDirectory) return target
@@ -131,10 +133,11 @@ export const Plugin = {
                 return target
               })
               const readOriginal = Effect.fnUntraced(function* (target: FileAccess.Target) {
-                const content = yield* FileMutation.readText(environment.files, target.absolute)
-                const text = Bom.join(content.text, content.bom)
-                if (!originals.has(target.absolute)) originals.set(target.absolute, { resource: target.resource, text })
-                return text
+                const bytes = (yield* environment.files.read(target.absolute)).bytes
+                const decoded = Bom.decodeBytes(bytes)
+                if (!originals.has(target.absolute))
+                  originals.set(target.absolute, { resource: target.resource, bytes })
+                return Bom.join(decoded.text, decoded.bom)
               })
               for (const hunk of hunks) {
                 yield* Effect.gen(function* () {
@@ -246,8 +249,8 @@ export const Plugin = {
                 Effect.gen(function* () {
                   // A re-read that no longer resolves is itself a change: the file moved, vanished, or
                   // became a directory while approval was pending.
-                  const current = yield* FileMutation.readText(environment.files, absolute).pipe(
-                    Effect.map((content) => Bom.join(content.text, content.bom)),
+                  const current = yield* environment.files.read(absolute).pipe(
+                    Effect.map((result) => result.bytes),
                     Effect.catchTag("Environment.NotFound", () => Effect.succeed(undefined)),
                     Effect.catchTag("Environment.WrongKind", () => Effect.succeed(undefined)),
                     Effect.mapError(
@@ -257,8 +260,10 @@ export const Plugin = {
                         }),
                     ),
                   )
-                  if (current === original.text) return undefined
-                  return original.resource
+                  if (current === undefined) return original.resource
+                  if (current.length !== original.bytes.length) return original.resource
+                  if (current.some((byte, index) => byte !== original.bytes[index])) return original.resource
+                  return undefined
                 }),
               ))
                 .filter((resource): resource is string => resource !== undefined)
