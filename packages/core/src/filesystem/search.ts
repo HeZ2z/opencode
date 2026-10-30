@@ -2,10 +2,11 @@ export * as FileSystemSearch from "./search.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import path from "path"
-import { Clock, Context, Deferred, Duration, Effect, Layer, Scope } from "effect"
+import { Clock, Context, Deferred, Duration, Effect, Layer, Ref, Scope, Semaphore } from "effect"
 import { Fff } from "#fff"
 import fuzzysort from "fuzzysort"
 import { FileSystem } from "@opencode/schema/filesystem"
+import { Environment } from "../environment/index.js"
 import { Location } from "../location.js"
 import { Ripgrep } from "../ripgrep.js"
 import { RelativePath } from "../schema.js"
@@ -49,10 +50,76 @@ function search(index: ReturnType<typeof emptyIndex>, input: FileSystem.FindInpu
   })
 }
 
+const DIRECTORY_CONCURRENCY = 8
+const DIRECTORY_LISTING_LIMIT = 20_000
+const DIRECTORY_DEADLINE = Duration.seconds(3)
+
+type DirectoryState = "empty" | "content" | "unknown"
+
+// ripgrep only reports files, so directories without an indexed file are missing from the index.
+// Walk the tree and add only the directories that are provably empty: a failed or budgeted-out
+// listing makes a directory "unknown", and an unknown child makes its parent unknown too. Known
+// directories (already indexed as a file's parent) are always descended so empty children under them
+// are still found, while an unknown directory that holds visible files is pruned so ignored subtrees
+// stay out of the index. The caller bounds the whole walk with a timeout.
+function walkDirectories(input: {
+  readonly files: Environment.Files
+  readonly directory: string
+  readonly home: boolean
+  readonly next: ReturnType<typeof emptyIndex>
+  readonly previous: ReturnType<typeof emptyIndex>
+}) {
+  const permits = Semaphore.makeUnsafe(DIRECTORY_CONCURRENCY)
+  return Effect.gen(function* () {
+    const budget = yield* Ref.make(0)
+    const protectedNames = input.home ? Protected.names() : undefined
+    const visit: (absolute: string, relative: string, known: boolean) => Effect.Effect<DirectoryState> = (
+      absolute,
+      relative,
+      known,
+    ) =>
+      Effect.gen(function* () {
+        const attempt = yield* Ref.updateAndGet(budget, (count) => count + 1)
+        if (attempt > DIRECTORY_LISTING_LIMIT) return "unknown"
+        const entries = yield* permits
+          .withPermit(input.files.list(absolute))
+          .pipe(Effect.match({ onFailure: () => undefined, onSuccess: (entries) => entries }))
+        // A known directory already holds an indexed file, so it is non-empty whether or not it lists.
+        if (!entries) return known ? "content" : "unknown"
+        const visible = entries.filter((entry) => entry.type === "file" && !entry.name.startsWith("."))
+        const children = entries.filter(
+          (entry) =>
+            entry.type === "directory" &&
+            !entry.name.startsWith(".") &&
+            !(relative === "" && protectedNames?.has(entry.name)),
+        )
+        if (!known && visible.length > 0) return "content"
+        const states = yield* Effect.forEach(
+          children,
+          (entry) => {
+            const child = relative === "" ? entry.name : `${relative}/${entry.name}`
+            return visit(path.join(absolute, entry.name), child, input.next.directories.has(`${child}${path.sep}`))
+          },
+          { concurrency: DIRECTORY_CONCURRENCY },
+        )
+        children.forEach((entry, index) => {
+          if (states[index] !== "empty") return
+          const child = relative === "" ? entry.name : `${relative}/${entry.name}`
+          const key = `${child}${path.sep}`
+          input.next.directories.set(key, input.previous.directories.get(key) ?? fuzzysort.prepare(key))
+        })
+        if (known) return "content"
+        return states.every((state) => state === "empty") ? "empty" : "content"
+      })
+    yield* visit(input.directory, "", true)
+  })
+}
+
 const ripgrepLayer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const location = yield* Location.Service
+    const environment = yield* Environment.Service
     const ripgrep = yield* Ripgrep.Service
     const scope = yield* Scope.Scope
     const clock = yield* Clock.Clock
@@ -81,6 +148,13 @@ const ripgrepLayer = Layer.effect(
             })
           }),
       })
+      yield* walkDirectories({
+        files: environment.files,
+        directory: location.directory,
+        home,
+        next,
+        previous,
+      }).pipe(Effect.timeoutOption(DIRECTORY_DEADLINE))
       index = next
       initialized = true
     }).pipe(Effect.orDie)
@@ -235,7 +309,11 @@ const layer = (options?: Options) =>
   )
 
 export function configured(options?: Options) {
-  return makeLocationNode({ service: Service, layer: layer(options), deps: [Location.node, Ripgrep.node] })
+  return makeLocationNode({
+    service: Service,
+    layer: layer(options),
+    deps: [Location.node, Ripgrep.node, Environment.node],
+  })
 }
 
 export const node = configured()

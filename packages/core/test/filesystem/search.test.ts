@@ -6,6 +6,7 @@ import path from "path"
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { Environment } from "@opencode/core/environment/index"
 import { FileSystem } from "@opencode/core/filesystem"
 import { Protected } from "@opencode/core/filesystem/protected"
 import { FileSystemSearch } from "@opencode/core/filesystem/search"
@@ -13,6 +14,7 @@ import { Location } from "@opencode/core/location"
 import { Ripgrep } from "@opencode/core/ripgrep"
 import { AbsolutePath, RelativePath } from "@opencode/core/schema"
 import { Workspace } from "@opencode/core/workspace"
+import { initGit } from "../fixture/git"
 import { location } from "../fixture/location"
 import { tmpdir } from "../fixture/tmpdir"
 import { it } from "../lib/effect"
@@ -200,6 +202,65 @@ describe("FileSystemSearch", () => {
     }),
   )
 
+  it.live("discovers empty directories in a git repository", () =>
+    Effect.gen(function* () {
+      const directory = (yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-search-empty-")))).path
+      yield* Effect.promise(() =>
+        Promise.all([
+          mkdir(path.join(directory, "emptydir")),
+          mkdir(path.join(directory, "keepdir")),
+          mkdir(path.join(directory, "nonempty")),
+          mkdir(path.join(directory, "src/empty-child"), { recursive: true }),
+          mkdir(path.join(directory, "ignored")),
+        ]),
+      )
+      yield* Effect.promise(() =>
+        Promise.all([
+          Bun.write(path.join(directory, ".gitignore"), "ignored/\n"),
+          Bun.write(path.join(directory, "keepdir/.gitkeep"), ""),
+          Bun.write(path.join(directory, "nonempty/file.txt"), "content"),
+          Bun.write(path.join(directory, "src/index.ts"), "content"),
+          Bun.write(path.join(directory, "ignored/with-file.txt"), "content"),
+        ]),
+      )
+      yield* Effect.promise(() => initGit(directory))
+
+      const layer = AppNodeBuilder.build(FileSystemSearch.configured({ fff: false }), [
+        Location.node.replace(
+          Layer.succeed(
+            Location.Service,
+            Location.Service.of(
+              location(
+                { directory: AbsolutePath.make(directory) },
+                { vcs: { type: "git", store: AbsolutePath.make(path.join(directory, ".git")) } },
+              ),
+            ),
+          ),
+        ),
+      ])
+
+      yield* Effect.gen(function* () {
+        const search = yield* FileSystemSearch.Service
+        expect((yield* search.find({ query: "emptydir", type: "directory" })).map((entry) => entry.path)).toContain(
+          RelativePath.make(`emptydir${path.sep}`),
+        )
+        // keepdir only holds a hidden file, so it must be empty to the directory index.
+        expect((yield* search.find({ query: "keepdir", type: "directory" })).map((entry) => entry.path)).toContain(
+          RelativePath.make(`keepdir${path.sep}`),
+        )
+        expect((yield* search.find({ query: "empty-child", type: "directory" })).map((entry) => entry.path)).toContain(
+          RelativePath.make(`src/empty-child${path.sep}`),
+        )
+        expect((yield* search.find({ query: "ignored", type: "directory" })).map((entry) => entry.path)).not.toContain(
+          RelativePath.make(`ignored${path.sep}`),
+        )
+        const mixed = yield* search.find({ query: "emptydir" })
+        expect(mixed.map((entry) => entry.path)).toContain(RelativePath.make(`emptydir${path.sep}`))
+        expect(mixed.every((entry) => entry.type === "directory")).toBe(true)
+      }).pipe(Effect.provide(layer))
+    }),
+  )
+
   it.live("selects the ripgrep layer for workspace-backed locations even when vcs would pick fff", () =>
     Effect.gen(function* () {
       const directory = (yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-search-workspace-"))))
@@ -213,6 +274,7 @@ describe("FileSystemSearch", () => {
         directory: AbsolutePath.make(directory),
         workspaceID: Workspace.ID.make("wrk_test"),
       })
+      const driver = Environment.makeMemoryDriver()
       const layer = AppNodeBuilder.build(FileSystemSearch.node, [
         Location.node.replace(
           Layer.succeed(
@@ -223,6 +285,15 @@ describe("FileSystemSearch", () => {
           ),
         ),
         Ripgrep.node.replace(ripgrepStub("remote.ts", (input) => (observed = input))),
+        Environment.node.replace(
+          Layer.succeed(
+            Environment.Service,
+            Environment.Service.of({
+              files: { ...Environment.makeFiles(driver), list: () => Effect.succeed([]) },
+              spawner: driver.spawner,
+            }),
+          ),
+        ),
       ])
 
       yield* Effect.gen(function* () {
@@ -238,6 +309,7 @@ describe("FileSystemSearch", () => {
     Effect.gen(function* () {
       let observed: Ripgrep.FindInput | undefined
       const home = AbsolutePath.make(os.homedir())
+      const driver = Environment.makeMemoryDriver()
       const layer = AppNodeBuilder.build(FileSystemSearch.node, [
         Location.node.replace(
           Layer.succeed(
@@ -251,6 +323,16 @@ describe("FileSystemSearch", () => {
           ),
         ),
         Ripgrep.node.replace(ripgrepStub("src/index.ts", (input) => (observed = input))),
+        // Keep the directory walk off the real home directory; this test only covers the ripgrep bounds.
+        Environment.node.replace(
+          Layer.succeed(
+            Environment.Service,
+            Environment.Service.of({
+              files: { ...Environment.makeFiles(driver), list: () => Effect.succeed([]) },
+              spawner: driver.spawner,
+            }),
+          ),
+        ),
       ])
       yield* Effect.gen(function* () {
         const search = yield* FileSystemSearch.Service
@@ -262,6 +344,74 @@ describe("FileSystemSearch", () => {
         expect((yield* search.find({ query: "src", type: "directory" }))[0]?.path).toBe(
           RelativePath.make(`src${path.sep}`),
         )
+      }).pipe(Effect.provide(layer))
+    }),
+  )
+
+  it.live("finds empty directories through the location environment without protected home names", () => {
+    // The memory driver resolves POSIX paths, so it cannot mirror a native Windows home path.
+    if (process.platform === "win32") return Effect.void
+    const driver = Environment.makeMemoryDriver()
+    const files = Environment.makeFiles(driver)
+    const home = os.homedir()
+    return Effect.gen(function* () {
+      yield* files.mkdir(path.join(home, "Documents"))
+      yield* files.mkdir(path.join(home, "code", "emptydir"))
+      const layer = AppNodeBuilder.build(FileSystemSearch.configured({ fff: false }), [
+        Location.node.replace(
+          Layer.succeed(Location.Service, Location.Service.of(location({ directory: AbsolutePath.make(home) }))),
+        ),
+        Ripgrep.node.replace(ripgrepStub("src/index.ts", () => {})),
+        Environment.node.replace(
+          Layer.succeed(Environment.Service, Environment.Service.of({ files, spawner: driver.spawner })),
+        ),
+      ])
+
+      yield* Effect.gen(function* () {
+        const search = yield* FileSystemSearch.Service
+        expect((yield* search.find({ query: "emptydir", type: "directory" })).map((entry) => entry.path)).toContain(
+          RelativePath.make(`code/emptydir${path.sep}`),
+        )
+        if (Protected.names().has("Documents"))
+          expect((yield* search.find({ query: "Documents", type: "directory" })).map((entry) => entry.path)).toEqual([])
+      }).pipe(Effect.provide(layer))
+    })
+  })
+
+  it.live("keeps the scan alive when a directory listing fails", () =>
+    Effect.gen(function* () {
+      const directory = path.join(os.tmpdir(), "opencode-search-unreadable")
+      const driver = Environment.makeMemoryDriver()
+      const files = Environment.makeFiles(driver)
+      const layer = AppNodeBuilder.build(FileSystemSearch.configured({ fff: false }), [
+        Location.node.replace(
+          Layer.succeed(Location.Service, Location.Service.of(location({ directory: AbsolutePath.make(directory) }))),
+        ),
+        Ripgrep.node.replace(ripgrepStub("src/index.ts", () => {})),
+        Environment.node.replace(
+          Layer.succeed(
+            Environment.Service,
+            Environment.Service.of({
+              files: {
+                ...files,
+                // The root lists a child that can never be read, so the child's emptiness stays unknown.
+                list: (target) =>
+                  target === directory
+                    ? Effect.succeed([{ name: "unreadable", type: "directory" as const }])
+                    : Effect.fail(new Environment.Failed({ path: target, cause: undefined })),
+              },
+              spawner: driver.spawner,
+            }),
+          ),
+        ),
+      ])
+
+      yield* Effect.gen(function* () {
+        const search = yield* FileSystemSearch.Service
+        expect((yield* search.find({ query: "index", type: "file" })).map((entry) => entry.path)).toEqual([
+          RelativePath.make("src/index.ts"),
+        ])
+        expect((yield* search.find({ query: "unreadable", type: "directory" })).map((entry) => entry.path)).toEqual([])
       }).pipe(Effect.provide(layer))
     }),
   )
