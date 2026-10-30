@@ -56,6 +56,7 @@ let denyAction: string | undefined
 let failRemoveTarget: string | undefined
 let failRemoveErrorTarget: string | undefined
 let failWriteTarget: string | undefined
+let failReadAfterApproval: string | undefined
 let readsBeforeEditApproval = 0
 let editApproved = false
 let afterEditApproval = (): Effect.Effect<void> => Effect.void
@@ -92,6 +93,7 @@ const reset = () => {
   failRemoveTarget = undefined
   failRemoveErrorTarget = undefined
   failWriteTarget = undefined
+  failReadAfterApproval = undefined
   readsBeforeEditApproval = 0
   editApproved = false
   afterEditApproval = () => Effect.void
@@ -117,9 +119,14 @@ const withTool = <A, E, R>(
         Environment.node.replace(
           transformEnvironmentFiles((files) => ({
             read: (target, range) =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 if (!editApproved) readsBeforeEditApproval++
-              }).pipe(Effect.andThen(files.read(target, range))),
+                if (editApproved && failReadAfterApproval && path.basename(target) === failReadAfterApproval)
+                  return yield* Effect.fail(
+                    new Environment.Failed({ path: target, cause: new Error("forced read failure") }),
+                  )
+                return yield* files.read(target, range)
+              }),
             remove: (target) => {
               if (failRemoveTarget && path.basename(target) === failRemoveTarget)
                 return Effect.die("forced remove failure")
@@ -1367,6 +1374,112 @@ describe("PatchTool", () => {
                   },
                 })
                 expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("remove\nkeep-me\n")
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects a delete of a file removed during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "remove.txt")
+        afterEditApproval = () => Effect.promise(() => fs.rm(target)).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "remove\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(registry, call("*** Begin Patch\n*** Delete File: remove.txt\n*** End Patch")),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: remove.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+                expect(yield* exists(target)).toBe(false)
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects a delete when the target becomes a directory during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "victim.txt")
+        afterEditApproval = () => Effect.promise(() => fs.rm(target).then(() => fs.mkdir(target))).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "victim\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(registry, call("*** Begin Patch\n*** Delete File: victim.txt\n*** End Patch")),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: victim.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("reports a verification read failure before writing anything", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const first = path.join(tmp.path, "first.txt")
+        const blocked = path.join(tmp.path, "blocked.txt")
+        failReadAfterApproval = path.basename(blocked)
+        return Effect.promise(() =>
+          Promise.all([fs.writeFile(first, "one\n"), fs.writeFile(blocked, "blocked\n")]),
+        ).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call(
+                      [
+                        "*** Begin Patch",
+                        "*** Update File: first.txt",
+                        "@@",
+                        "-one",
+                        "+ONE",
+                        "*** Update File: blocked.txt",
+                        "@@",
+                        "-blocked",
+                        "+BLOCKED",
+                        "*** End Patch",
+                      ].join("\n"),
+                    ),
+                  ),
+                ).toMatchObject({
+                  status: "error",
+                  error: { message: "Failed to verify blocked.txt before writing: forced read failure" },
+                })
+                expect(yield* Effect.promise(() => fs.readFile(first, "utf8"))).toBe("one\n")
+                expect(yield* Effect.promise(() => fs.readFile(blocked, "utf8"))).toBe("blocked\n")
               }),
             ),
           ),
