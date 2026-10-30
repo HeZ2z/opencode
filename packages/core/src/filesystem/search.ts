@@ -55,13 +55,16 @@ const DIRECTORY_LISTING_LIMIT = 20_000
 const DIRECTORY_DEADLINE = Duration.seconds(3)
 
 type DirectoryState = "empty" | "content" | "unknown"
+type DirectoryVisit = { readonly state: DirectoryState; readonly added: readonly string[] }
 
 // ripgrep only reports files, so directories without an indexed file are missing from the index.
 // Walk the tree and add only the directories that are provably empty: a failed or budgeted-out
 // listing makes a directory "unknown", and an unknown child makes its parent unknown too. Known
 // directories (already indexed as a file's parent) are always descended so empty children under them
-// are still found, while an unknown directory that holds visible files is pruned so ignored subtrees
-// stay out of the index. The caller bounds the whole walk with a timeout.
+// are still found, while a non-known directory that holds visible files is pruned so ignored subtrees
+// stay out of the index. Additions are staged per subtree and published once the root visit
+// completes, so a pruned or unknown subtree publishes nothing; a walk cut off by the caller's
+// deadline publishes no discovered directories at all (the index keeps rg-derived parents only).
 function walkDirectories(input: {
   readonly files: Environment.Files
   readonly directory: string
@@ -73,19 +76,19 @@ function walkDirectories(input: {
   return Effect.gen(function* () {
     const budget = yield* Ref.make(0)
     const protectedNames = input.home ? Protected.names() : undefined
-    const visit: (absolute: string, relative: string, known: boolean) => Effect.Effect<DirectoryState> = (
+    const visit: (absolute: string, relative: string, known: boolean) => Effect.Effect<DirectoryVisit> = (
       absolute,
       relative,
       known,
     ) =>
       Effect.gen(function* () {
         const attempt = yield* Ref.updateAndGet(budget, (count) => count + 1)
-        if (attempt > DIRECTORY_LISTING_LIMIT) return "unknown"
+        if (attempt > DIRECTORY_LISTING_LIMIT) return { state: "unknown" as const, added: [] }
         const entries = yield* permits
           .withPermit(input.files.list(absolute))
           .pipe(Effect.match({ onFailure: () => undefined, onSuccess: (entries) => entries }))
         // A known directory already holds an indexed file, so it is non-empty whether or not it lists.
-        if (!entries) return known ? "content" : "unknown"
+        if (!entries) return { state: known ? ("content" as const) : ("unknown" as const), added: [] }
         const visible = entries.filter((entry) => entry.type === "file" && !entry.name.startsWith("."))
         const children = entries.filter(
           (entry) =>
@@ -93,25 +96,31 @@ function walkDirectories(input: {
             !entry.name.startsWith(".") &&
             !(relative === "" && protectedNames?.has(entry.name)),
         )
-        if (!known && visible.length > 0) return "content"
-        const states = yield* Effect.forEach(
+        if (!known && visible.length > 0) return { state: "content" as const, added: [] }
+        const results = yield* Effect.forEach(
           children,
           (entry) => {
             const child = relative === "" ? entry.name : `${relative}/${entry.name}`
-            return visit(path.join(absolute, entry.name), child, input.next.directories.has(`${child}${path.sep}`))
+            const childKnown = input.next.directories.has(`${child}${path.sep}`)
+            return visit(path.join(absolute, entry.name), child, childKnown).pipe(
+              Effect.map((result) => ({ key: `${child}${path.sep}`, known: childKnown, ...result })),
+            )
           },
           { concurrency: DIRECTORY_CONCURRENCY },
         )
-        children.forEach((entry, index) => {
-          if (states[index] !== "empty") return
-          const child = relative === "" ? entry.name : `${relative}/${entry.name}`
-          const key = `${child}${path.sep}`
-          input.next.directories.set(key, input.previous.directories.get(key) ?? fuzzysort.prepare(key))
+        const added = results.flatMap((result) => {
+          if (result.state === "empty") return [result.key, ...result.added]
+          return result.known ? result.added : []
         })
-        if (known) return "content"
-        return states.every((state) => state === "empty") ? "empty" : "content"
+        if (known) return { state: "content" as const, added }
+        return results.every((result) => result.state === "empty")
+          ? { state: "empty" as const, added }
+          : { state: "content" as const, added: [] }
       })
-    yield* visit(input.directory, "", true)
+    const discovered = yield* visit(input.directory, "", true)
+    discovered.added.forEach((key) => {
+      input.next.directories.set(key, input.previous.directories.get(key) ?? fuzzysort.prepare(key))
+    })
   })
 }
 

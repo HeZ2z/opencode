@@ -211,7 +211,8 @@ describe("FileSystemSearch", () => {
           mkdir(path.join(directory, "keepdir")),
           mkdir(path.join(directory, "nonempty")),
           mkdir(path.join(directory, "src/empty-child"), { recursive: true }),
-          mkdir(path.join(directory, "ignored")),
+          mkdir(path.join(directory, "ignored/nested"), { recursive: true }),
+          mkdir(path.join(directory, "ignored/empty"), { recursive: true }),
         ]),
       )
       yield* Effect.promise(() =>
@@ -220,7 +221,7 @@ describe("FileSystemSearch", () => {
           Bun.write(path.join(directory, "keepdir/.gitkeep"), ""),
           Bun.write(path.join(directory, "nonempty/file.txt"), "content"),
           Bun.write(path.join(directory, "src/index.ts"), "content"),
-          Bun.write(path.join(directory, "ignored/with-file.txt"), "content"),
+          Bun.write(path.join(directory, "ignored/nested/file.txt"), "content"),
         ]),
       )
       yield* Effect.promise(() => initGit(directory))
@@ -253,6 +254,10 @@ describe("FileSystemSearch", () => {
         )
         expect((yield* search.find({ query: "ignored", type: "directory" })).map((entry) => entry.path)).not.toContain(
           RelativePath.make(`ignored${path.sep}`),
+        )
+        // The ignored subtree is pruned, so its empty descendant must not leak into the index.
+        expect((yield* search.find({ query: "ignored", type: "directory" })).map((entry) => entry.path)).not.toContain(
+          RelativePath.make(`ignored/empty${path.sep}`),
         )
         const mixed = yield* search.find({ query: "emptydir" })
         expect(mixed.map((entry) => entry.path)).toContain(RelativePath.make(`emptydir${path.sep}`))
@@ -394,11 +399,18 @@ describe("FileSystemSearch", () => {
             Environment.Service.of({
               files: {
                 ...files,
-                // The root lists a child that can never be read, so the child's emptiness stays unknown.
-                list: (target) =>
-                  target === directory
-                    ? Effect.succeed([{ name: "unreadable", type: "directory" as const }])
-                    : Effect.fail(new Environment.Failed({ path: target, cause: undefined })),
+                // One empty candidate child next to an unknown one: the parent is content, so neither
+                // the parent nor the empty child may be published.
+                list: (target) => {
+                  if (target === directory) return Effect.succeed([{ name: "candidate", type: "directory" as const }])
+                  if (target === path.join(directory, "candidate"))
+                    return Effect.succeed([
+                      { name: "empty", type: "directory" as const },
+                      { name: "unreadable", type: "directory" as const },
+                    ])
+                  if (target === path.join(directory, "candidate", "empty")) return Effect.succeed([])
+                  return Effect.fail(new Environment.Failed({ path: target, cause: undefined }))
+                },
               },
               spawner: driver.spawner,
             }),
@@ -411,7 +423,12 @@ describe("FileSystemSearch", () => {
         expect((yield* search.find({ query: "index", type: "file" })).map((entry) => entry.path)).toEqual([
           RelativePath.make("src/index.ts"),
         ])
-        expect((yield* search.find({ query: "unreadable", type: "directory" })).map((entry) => entry.path)).toEqual([])
+        expect(
+          (yield* search.find({ query: "candidate", type: "directory" })).map((entry) => entry.path),
+        ).not.toContain(RelativePath.make(`candidate/empty${path.sep}`))
+        expect(
+          (yield* search.find({ query: "candidate", type: "directory" })).map((entry) => entry.path),
+        ).not.toContain(RelativePath.make(`candidate${path.sep}`))
       }).pipe(Effect.provide(layer))
     }),
   )
