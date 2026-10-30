@@ -1282,6 +1282,100 @@ describe("PatchTool", () => {
     ),
   )
 
+  it.live("rejects an update that would overwrite an external edit made during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "edited.txt")
+        afterEditApproval = () =>
+          Effect.promise(() => fs.writeFile(target, "first=old\nsecond=external-change\n")).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "first=old\nsecond=old\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call("*** Begin Patch\n*** Update File: edited.txt\n@@\n-first=old\n+first=new\n*** End Patch"),
+                  ),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: edited.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe(
+                  "first=old\nsecond=external-change\n",
+                )
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("applies the update when the file is unchanged during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "steady.txt")
+        afterEditApproval = () =>
+          Effect.promise(() => fs.writeFile(target, "first=old\nsecond=old\n")).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "first=old\nsecond=old\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call("*** Begin Patch\n*** Update File: steady.txt\n@@\n-first=old\n+first=new\n*** End Patch"),
+                  ),
+                ).toMatchObject({ status: "completed" })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("first=new\nsecond=old\n")
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects a delete of a file edited during approval", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "remove.txt")
+        afterEditApproval = () => Effect.promise(() => fs.writeFile(target, "remove\nkeep-me\n")).pipe(Effect.orDie)
+        return Effect.promise(() => fs.writeFile(target, "remove\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(registry, call("*** Begin Patch\n*** Delete File: remove.txt\n*** End Patch")),
+                ).toMatchObject({
+                  status: "error",
+                  error: {
+                    message:
+                      "patch rejected: remove.txt changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.",
+                  },
+                })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("remove\nkeep-me\n")
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("preserves a later commit defect after earlier sequential applications", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

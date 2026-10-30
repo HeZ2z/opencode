@@ -114,6 +114,13 @@ export const Plugin = {
               }
               const prepared: Prepared[] = []
               const updates = new Map<string, string | null>()
+              // Preflight reads each update/delete target once, so remembering that decoded text lets the
+              // patch fail instead of silently discarding an editor save that landed while approval was
+              // pending. This detects changes observed in preflight; it is not atomicity: an external write
+              // between this check and the write below, or a formatter rewrite, can still interleave.
+              // `add` never reads its target, so it records no snapshot and keeps overwrite semantics; an
+              // `add` followed by `delete`/`update` on the same path inherits that and is out of scope.
+              const originals = new Map<string, { readonly resource: string; readonly text: string }>()
               const resolveTarget = Effect.fnUntraced(function* (value: string) {
                 const target = yield* access.resolve({ path: value, kind: "file" })
                 if (!target.externalDirectory) return target
@@ -122,6 +129,12 @@ export const Plugin = {
                   parentDir: target.externalDirectory.directory,
                 })
                 return target
+              })
+              const readOriginal = Effect.fnUntraced(function* (target: FileAccess.Target) {
+                const content = yield* FileMutation.readText(environment.files, target.absolute)
+                const text = Bom.join(content.text, content.bom)
+                if (!originals.has(target.absolute)) originals.set(target.absolute, { resource: target.resource, text })
+                return text
               })
               for (const hunk of hunks) {
                 yield* Effect.gen(function* () {
@@ -149,14 +162,16 @@ export const Plugin = {
                     const before =
                       previous !== undefined
                         ? Bom.split(previous).text
-                        : (yield* FileMutation.readText(environment.files, target.absolute).pipe(
-                            Effect.mapError(
-                              (error) =>
-                                new ToolFailure({
-                                  message: `patch verification failed: Failed to delete ${target.resource}: ${errorMessage(error)}`,
-                                }),
+                        : Bom.split(
+                            yield* readOriginal(target).pipe(
+                              Effect.mapError(
+                                (error) =>
+                                  new ToolFailure({
+                                    message: `patch verification failed: Failed to delete ${target.resource}: ${errorMessage(error)}`,
+                                  }),
+                              ),
                             ),
-                          )).text
+                          ).text
                     prepared.push({ ...hunk, target, before, after: "" })
                     updates.set(target.absolute, null)
                     return
@@ -169,17 +184,14 @@ export const Plugin = {
                   }
                   const original =
                     previous ??
-                    (yield* Effect.gen(function* () {
-                      const content = yield* FileMutation.readText(environment.files, target.absolute).pipe(
-                        Effect.mapError(
-                          (error) =>
-                            new ToolFailure({
-                              message: `patch verification failed: Failed to read file to update ${target.absolute}: ${errorMessage(error)}`,
-                            }),
-                        ),
-                      )
-                      return Bom.join(content.text, content.bom)
-                    }))
+                    (yield* readOriginal(target).pipe(
+                      Effect.mapError(
+                        (error) =>
+                          new ToolFailure({
+                            message: `patch verification failed: Failed to read file to update ${target.absolute}: ${errorMessage(error)}`,
+                          }),
+                      ),
+                    ))
                   const before = Bom.split(original).text
                   const update = yield* Effect.try({
                     try: () => Patch.derive(hunk.path, hunk.chunks, original),
@@ -229,6 +241,32 @@ export const Plugin = {
                 agent: context.agent,
                 source,
               })
+
+              const conflicting = (yield* Effect.forEach([...originals.entries()], ([absolute, original]) =>
+                Effect.gen(function* () {
+                  // A re-read that no longer resolves is itself a change: the file moved, vanished, or
+                  // became a directory while approval was pending.
+                  const current = yield* FileMutation.readText(environment.files, absolute).pipe(
+                    Effect.map((content) => Bom.join(content.text, content.bom)),
+                    Effect.catchTag("Environment.NotFound", () => Effect.succeed(undefined)),
+                    Effect.catchTag("Environment.WrongKind", () => Effect.succeed(undefined)),
+                    Effect.mapError(
+                      (error) =>
+                        new ToolFailure({
+                          message: `Failed to verify ${original.resource} before writing: ${errorMessage(error)}`,
+                        }),
+                    ),
+                  )
+                  if (current === original.text) return undefined
+                  return original.resource
+                }),
+              ))
+                .filter((resource): resource is string => resource !== undefined)
+                .sort()
+              if (conflicting.length > 0)
+                return yield* new ToolFailure({
+                  message: `patch rejected: ${conflicting.join(", ")} changed on disk while the patch was waiting for approval. Nothing was written. Read the file again and reapply the patch.`,
+                })
 
               yield* Effect.forEach(
                 prepared,
