@@ -120,8 +120,10 @@ export const Plugin = {
               // invalid UTF-8 bytes, a BOM, or line endings. This detects changes observed in preflight;
               // it is not atomicity: an external write between this check and the write below, or a
               // formatter rewrite, can still interleave. `add` never reads its target, so it records no
-              // snapshot and keeps overwrite semantics, and a `*** Move to:` destination is never read
-              // either; an `add` followed by `delete`/`update` on the same path inherits the same.
+              // snapshot and keeps overwrite semantics, and an `add` followed by `delete`/`update` on the
+              // same path inherits the same. A `*** Move to:` destination is never read either, so an
+              // external edit to an existing destination is still overwritten: a known gap, left for a
+              // change that guards destinations, not an intended outcome.
               const originals = new Map<string, { readonly resource: string; readonly bytes: Uint8Array }>()
               const resolveTarget = Effect.fnUntraced(function* (value: string) {
                 const target = yield* access.resolve({ path: value, kind: "file" })

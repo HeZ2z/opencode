@@ -1413,48 +1413,6 @@ describe("PatchTool", () => {
     ),
   )
 
-  it.live("overwrites an existing move destination that changed during approval", () =>
-    Effect.acquireUseRelease(
-      Effect.promise(() => tmpdir()),
-      (tmp) => {
-        reset()
-        const source = path.join(tmp.path, "old.txt")
-        const destination = path.join(tmp.path, "dest.txt")
-        afterEditApproval = () =>
-          Effect.promise(() => fs.writeFile(destination, "existing\nEXTERNAL\n")).pipe(Effect.orDie)
-        return Effect.promise(() =>
-          Promise.all([fs.writeFile(source, "before\n"), fs.writeFile(destination, "existing\n")]),
-        ).pipe(
-          Effect.andThen(
-            withTool(tmp.path, (registry) =>
-              Effect.gen(function* () {
-                expect(
-                  yield* executeTool(
-                    registry,
-                    call(
-                      [
-                        "*** Begin Patch",
-                        "*** Update File: old.txt",
-                        "*** Move to: dest.txt",
-                        "@@",
-                        "-before",
-                        "+after",
-                        "*** End Patch",
-                      ].join("\n"),
-                    ),
-                  ),
-                ).toMatchObject({ status: "completed" })
-                expect(yield* Effect.promise(() => fs.readFile(destination, "utf8"))).toBe("after\n")
-                expect(yield* exists(source)).toBe(false)
-              }),
-            ),
-          ),
-        )
-      },
-      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
-    ),
-  )
-
   it.live("preserves a later commit defect after earlier sequential applications", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
