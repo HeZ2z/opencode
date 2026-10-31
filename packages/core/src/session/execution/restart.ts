@@ -3,12 +3,14 @@ export * as SessionRestart from "./restart.js"
 import { Context, Effect, Layer } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Bus } from "../../bus.js"
+import { Database } from "../../database/database.js"
 import { Job } from "../../job.js"
 import { Session } from "../../session.js"
 import { SessionEvent } from "../event.js"
 import { SessionExecution } from "../execution.js"
 import { SessionSchema } from "../schema.js"
 import { SessionStore } from "../store.js"
+import { SessionInbox } from "../inbox.js"
 import { ImageNotice } from "../../image/notice.js"
 import { ShellResult } from "../../shell/result.js"
 import { SubagentCompletion } from "../subagent-completion.js"
@@ -72,6 +74,7 @@ export const layer = (options?: Options) =>
       const bus = yield* Bus.Service
       const jobs = yield* Job.Service
       const sessions = yield* Session.Service
+      const db = (yield* Database.Service).db
       const scope = yield* Effect.scope
       const maxAttempts = options?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
 
@@ -82,12 +85,23 @@ export const layer = (options?: Options) =>
         if (attempts === undefined) return false
         if (attempts > maxAttempts) {
           // Terminalize instead: the release hook clears the claim and resets the
-          // counter atomically with the terminal event.
-          yield* bus.publish(
+          // counter atomically with the terminal event. Retirement rides in the same
+          // transaction and is scoped to the rows that existed at this decision, so a
+          // prompt admitted while this turn settles stays eligible.
+          const through = yield* SessionInbox.latestEnqueuedSeq(db, sessionID)
+          const terminal = [
             SessionEvent.Execution.Failed,
             { sessionID, error: RESUME_EXHAUSTED },
             { commit: () => store.release(sessionID) },
-          )
+          ] as const
+          if (through === undefined) {
+            yield* bus.publish(...terminal)
+            return false
+          }
+          yield* bus.publishAll([
+            terminal,
+            [SessionEvent.InboxResumeRetired, { sessionID, reason: "exhausted", through } as const, undefined] as const,
+          ])
           return false
         }
         yield* bus.publish(SessionEvent.Synthetic, {
@@ -264,5 +278,5 @@ export const layer = (options?: Options) =>
 export const node = makeGlobalNode({
   service: Service,
   layer: layer(),
-  deps: [SessionStore.node, SessionExecution.node, Bus.node, Job.node, Session.node],
+  deps: [SessionStore.node, SessionExecution.node, Bus.node, Job.node, Session.node, Database.node],
 })

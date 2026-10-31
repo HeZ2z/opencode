@@ -788,6 +788,12 @@ const layer = Layer.effectDiscard(
         delivery: event.data.delivery,
       }),
     )
+    yield* bus.project(SessionEvent.InboxResumeRetired, (event) =>
+      SessionInbox.projectResumeRetired(db, {
+        sessionID: event.data.sessionID,
+        through: event.data.through,
+      }),
+    )
     yield* bus.project(SessionEvent.Execution.Started, (event) =>
       db
         .update(SessionTable)
