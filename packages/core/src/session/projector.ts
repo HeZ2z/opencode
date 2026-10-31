@@ -764,6 +764,7 @@ const layer = Layer.effectDiscard(
           id: event.data.inboxID,
           sessionID: event.data.sessionID,
           item: event.data.item,
+          resume: event.data.resume,
           timeCreated: event.created,
         })
         yield* db
